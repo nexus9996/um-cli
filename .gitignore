@@ -18,3 +18,4 @@
 /.venv/
 .DS_Store
 /temp_target.mflac
+/go-mmkv-main.zip
