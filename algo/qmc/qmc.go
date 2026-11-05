@@ -144,7 +144,7 @@ func (d *Decoder) resolveKey(footer *fileFooter) ([]byte, error) {
 
 	if footer.kind == footerMusicEx {
 		if runtime.GOOS == "darwin" && footer.mediaFileName != "" {
-			if key, err := readKeyFromMMKVCustom(footer.mediaFileName); err == nil {
+			if key, err := readKeyFromMMKVCustom(footer.mediaFileName, d.logger); err == nil {
 				return key, nil
 			} else {
 				d.logger.Debug("mmkv lookup by media filename failed",

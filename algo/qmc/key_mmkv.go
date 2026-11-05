@@ -7,16 +7,23 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 
-	"github.com/samber/lo"
 	"go.uber.org/zap"
-	"golang.org/x/exp/slices"
 	"golang.org/x/text/unicode/norm"
 	"unlock-music.dev/mmkv"
 )
 
 var streamKeyVault mmkv.Vault
 var streamKeyVaults []mmkv.Vault // fallback vaults for QQ Music 20.x+ encrypted vaults
+
+// Vault discovery runs at most once per process: on QQ Music 20.x+ the
+// plaintext vault is a zeroed placeholder, so retrying it for every input file
+// only repeated the same warnings.
+var (
+	mmkvInitOnce sync.Once
+	mmkvInitErr  error
+)
 
 // VaultCryptoKey is the AES-128 key used to decrypt version-3 encrypted MMKV vaults.
 // Set via CLI flag --qmc-mmkv-key or by calling SetVaultCryptoKey.
@@ -38,68 +45,13 @@ func readKeyFromMMKV(file string, logger *zap.Logger) ([]byte, error) {
 		return nil, errors.New("mmkv vault not supported on this platform")
 	}
 
-	if streamKeyVault == nil {
-		mmkvDir, err := getRelativeMMKVDir(file)
-		if err != nil {
-			mmkvDir, err = getDefaultMMKVDir()
-			if err != nil {
-				return nil, fmt.Errorf("mmkv key valut not found: %w", err)
-			}
-		}
-
-		mgr, err := mmkv.NewManager(mmkvDir)
-		if err != nil {
-			return nil, fmt.Errorf("init mmkv manager: %w", err)
-		}
-
-		streamKeyVault, err = mgr.OpenVault("MMKVStreamEncryptId")
-		if err != nil {
-			// Plain vault failed (e.g., empty/corrupted) — try encrypted vaults for QQ Music 20.x+
-			logger.Warn("plain mmkv vault open failed, trying encrypted vaults", zap.Error(err))
-			encErr := tryInitEncryptedVault(logger)
-			if encErr != nil {
-				return nil, fmt.Errorf("open mmkv vault: %w (encrypted fallback: %w)", err, encErr)
-			}
-		} else if len(streamKeyVault.Keys()) == 0 {
-			// Vault opened but is empty — try encrypted vaults for QQ Music 20.x+
-			logger.Debug("plain mmkv vault is empty, trying encrypted vaults")
-			encErr := tryInitEncryptedVault(logger)
-			if encErr != nil {
-				logger.Debug("encrypted vault fallback also failed", zap.Error(encErr))
-			}
-		}
-
-		if streamKeyVault != nil {
-			logger.Debug("mmkv vault opened", zap.Strings("keys", streamKeyVault.Keys()))
-		}
+	if err := initMMKVVaults(file, logger); err != nil {
+		return nil, err
 	}
 
-	_, partName := filepath.Split(file)
-	partName = normalizeUnicode(partName)
-
-	buf, err := streamKeyVault.GetBytes(file)
-	if buf == nil {
-		filePaths := streamKeyVault.Keys()
-		fileNames := lo.Map(filePaths, func(filePath string, _ int) string {
-			_, name := filepath.Split(filePath)
-			return normalizeUnicode(name)
-		})
-
-		for _, key := range fileNames { // fallback: match filename only
-			if key != partName {
-				continue
-			}
-			idx := slices.Index(fileNames, key)
-			buf, err = streamKeyVault.GetBytes(filePaths[idx])
-			if err != nil {
-				logger.Warn("read key from mmkv", zap.String("key", filePaths[idx]), zap.Error(err))
-			}
-		}
-
-	}
-
-	if len(buf) == 0 {
-		return nil, errors.New("key not found in mmkv vault")
+	buf, err := lookupKeyInVaults(file)
+	if err != nil {
+		return nil, err
 	}
 
 	return deriveKey(buf)
@@ -124,59 +76,149 @@ func OpenMMKV(mmkvPath string, key string, logger *zap.Logger) error {
 	return nil
 }
 
-// /
-func readKeyFromMMKVCustom(mid string) ([]byte, error) {
-	if streamKeyVault == nil {
-		return nil, fmt.Errorf("mmkv vault not loaded")
+// lookupKeyInVaults returns the raw ekey stored for file, consulting the primary
+// vault first and then every encrypted vault loaded during discovery. Older
+// builds key entries by absolute path, newer ones by media file name, and macOS
+// may hand the name out in a different Unicode normalization, so three passes
+// are needed.
+func lookupKeyInVaults(file string) ([]byte, error) {
+	vaults := make([]mmkv.Vault, 0, 1+len(streamKeyVaults))
+	if streamKeyVault != nil {
+		vaults = append(vaults, streamKeyVault)
+	}
+	vaults = append(vaults, streamKeyVaults...)
+	if len(vaults) == 0 {
+		return nil, errors.New("no mmkv vault loaded")
 	}
 
-	// Try primary vault first
-	eKey, err := streamKeyVault.GetBytes(mid)
-	if err == nil {
-		return deriveKey(eKey)
-	}
-
-	// Fallback: try every encrypted vault loaded during auto-discovery.
-	//
-	// Do NOT compare the vaults with == to skip the primary one: their dynamic
-	// type (mmkv.vault) is a map, which is not comparable, so comparing two
-	// interface values panics at runtime. Re-querying the primary vault is
-	// cheap and harmless.
-	for _, v := range streamKeyVaults {
-		eKey, fallbackErr := v.GetBytes(mid)
-		if fallbackErr == nil {
-			return deriveKey(eKey)
+	for _, v := range vaults {
+		if buf, err := v.GetBytes(file); err == nil && len(buf) > 0 {
+			return buf, nil
 		}
 	}
 
-	return nil, fmt.Errorf("get eKey error: %w", err)
+	_, partName := filepath.Split(file)
+	partName = normalizeUnicode(partName)
+	for _, v := range vaults {
+		for _, key := range v.Keys() {
+			_, name := filepath.Split(key)
+			if normalizeUnicode(name) != partName {
+				continue
+			}
+			if buf, err := v.GetBytes(key); err == nil && len(buf) > 0 {
+				return buf, nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("key not found in mmkv vault: %s", partName)
 }
 
-// tryInitEncryptedVault attempts to locate and open an encrypted version-3 MMKV vault
-// in the default iData directory. This is needed for QQ Music 20.x+ which stores
-// stream encryption keys in AES-encrypted vaults instead of the plain MMKVStreamEncryptId.
-func tryInitEncryptedVault(logger *zap.Logger) error {
-	if VaultCryptoKey == "" {
-		logger.Warn("tryInitEncryptedVault: no crypto key configured")
-		return fmt.Errorf("no vault crypto key configured")
+// readKeyFromMMKVCustom looks the ekey up by the media file name / mid stored
+// in the musicex footer.
+func readKeyFromMMKVCustom(mid string, logger *zap.Logger) ([]byte, error) {
+	if err := initMMKVVaults("", logger); err != nil {
+		return nil, fmt.Errorf("mmkv vault not loaded: %w", err)
 	}
-	logger.Info("tryInitEncryptedVault: attempting with crypto key", zap.Int("key_len", len(VaultCryptoKey)))
 
-	mmkvDir, err := getDefaultMMKVDir()
+	buf, err := lookupKeyInVaults(mid)
 	if err != nil {
-		// getDefaultMMKVDir checks for MMKVStreamEncryptId existence, which may fail.
-		// Reconstruct the dir path directly.
-		homeDir, homeErr := os.UserHomeDir()
-		if homeErr != nil {
-			return fmt.Errorf("cannot locate mmkv dir: %w (original: %w)", homeErr, err)
-		}
-		mmkvDir = filepath.Join(
-			homeDir,
-			"Library/Containers/com.tencent.QQMusicMac/Data",
-			"Library/Application Support/QQMusicMac/iData",
-		)
+		return nil, fmt.Errorf("get eKey error: %w", err)
 	}
 
+	return deriveKey(buf)
+}
+
+// initMMKVVaults locates and opens the MMKV key vaults once per process, so a
+// legacy placeholder vault does not repeat the same warnings for every file.
+func initMMKVVaults(file string, logger *zap.Logger) error {
+	mmkvInitOnce.Do(func() {
+		// An explicit --qmc-mmkv vault takes precedence over auto-discovery.
+		if streamKeyVault != nil {
+			return
+		}
+		mmkvDir, err := getRelativeMMKVDir(file)
+		if err != nil {
+			mmkvDir, err = getDefaultMMKVDir()
+			if err != nil {
+				mmkvInitErr = fmt.Errorf("mmkv key vault not found: %w", err)
+				return
+			}
+		}
+		mmkvInitErr = openMMKVVaults(mmkvDir, encryptedVaultDir(), logger)
+	})
+	return mmkvInitErr
+}
+
+// encryptedVaultDir returns the iData directory holding the encrypted vaults.
+// getDefaultMMKVDir insists on MMKVStreamEncryptId existing, which 20.x+ may not
+// keep, so fall back to the well-known path.
+func encryptedVaultDir() string {
+	if dir, err := getDefaultMMKVDir(); err == nil {
+		return dir
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(
+		homeDir,
+		"Library/Containers/com.tencent.QQMusicMac/Data",
+		"Library/Application Support/QQMusicMac/iData",
+	)
+}
+
+// openMMKVVaults opens the plaintext vault in plainDir and, when a crypto key is
+// configured, the AES-encrypted vaults in encDir. An empty plaintext vault is
+// expected on QQ Music 20.x+ and is only reported at debug level.
+func openMMKVVaults(plainDir, encDir string, logger *zap.Logger) error {
+	streamKeyVault = nil
+	streamKeyVaults = nil
+
+	mgr, err := mmkv.NewManager(plainDir)
+	if err != nil {
+		return fmt.Errorf("init mmkv manager: %w", err)
+	}
+
+	var plainErr error
+	vault, err := mgr.OpenVault("MMKVStreamEncryptId")
+	switch {
+	case errors.Is(err, mmkv.ErrVaultEmpty):
+		// QQ Music 20.x+ keeps the legacy plaintext vault as zeroed pages and
+		// moved the keys into the encrypted vaults; this is not a failure.
+		logger.Debug("plain mmkv vault is empty (QQ Music 20.x+ keeps it as a placeholder)")
+		plainErr = err
+	case err != nil:
+		logger.Warn("plain mmkv vault open failed", zap.Error(err))
+		plainErr = err
+	case len(vault.Keys()) == 0:
+		logger.Debug("plain mmkv vault holds no keys")
+		plainErr = errors.New("plain mmkv vault is empty")
+	default:
+		streamKeyVault = vault
+		logger.Debug("mmkv vault opened", zap.Strings("keys", vault.Keys()))
+	}
+
+	if VaultCryptoKey == "" {
+		if plainErr != nil {
+			return fmt.Errorf("no usable MMKV vault: %v; the encrypted vaults need --qmc-mmkv-key", plainErr)
+		}
+		return nil
+	}
+
+	encErr := openEncryptedVaults(encDir, logger)
+	if encErr != nil {
+		if plainErr != nil {
+			return fmt.Errorf("plaintext vault unusable (%v); encrypted vaults: %w", plainErr, encErr)
+		}
+		logger.Debug("encrypted mmkv vaults unusable, keeping the plaintext vault", zap.Error(encErr))
+	}
+	return nil
+}
+
+// openEncryptedVaults opens the AES-encrypted vaults that QQ Music 20.x+ writes
+// and records every vault holding keys as a lookup fallback.
+func openEncryptedVaults(mmkvDir string, logger *zap.Logger) error {
 	mgr, mgrErr := mmkv.NewManager(mmkvDir)
 	if mgrErr != nil {
 		return fmt.Errorf("init mmkv manager for encrypted vault: %w", mgrErr)
@@ -217,7 +259,8 @@ func tryInitEncryptedVault(logger *zap.Logger) error {
 	for _, vaultID := range candidateIDs {
 		vault, openErr := mgr.OpenVaultCrypto(vaultID, VaultCryptoKey)
 		if openErr != nil {
-			logger.Warn("try encrypted vault failed",
+			// Candidates are speculative: non-matching IDs are expected to fail.
+			logger.Debug("encrypted vault not usable",
 				zap.String("vault", vaultID),
 				zap.Error(openErr))
 			continue
@@ -244,20 +287,18 @@ func tryInitEncryptedVault(logger *zap.Logger) error {
 		}
 	}
 
-	if streamKeyVault != nil {
-		logger.Info("encrypted mmkv vault(s) loaded",
-			zap.Int("vaults", len(streamKeyVaults)),
-			zap.Int("total_keys", func() int {
-				count := 0
-				for _, v := range streamKeyVaults {
-					count += len(v.Keys())
-				}
-				return count
-			}()))
-		return nil
+	if len(streamKeyVaults) == 0 {
+		return fmt.Errorf("no compatible encrypted vault found in %s", mmkvDir)
 	}
 
-	return fmt.Errorf("no compatible encrypted vault found")
+	totalKeys := 0
+	for _, v := range streamKeyVaults {
+		totalKeys += len(v.Keys())
+	}
+	logger.Debug("encrypted mmkv vault(s) loaded",
+		zap.Int("vaults", len(streamKeyVaults)),
+		zap.Int("total_keys", totalKeys))
+	return nil
 }
 
 // / getRelativeMMKVDir get mmkv dir relative to file (legacy QQMusic for macOS behaviour)

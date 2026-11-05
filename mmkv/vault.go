@@ -5,6 +5,7 @@ import (
 	"crypto/cipher"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -15,6 +16,22 @@ import (
 )
 
 type vault map[string][]byte
+
+// ErrVaultEmpty reports a placeholder vault rather than a corrupt one: QQ Music
+// 20.x+ leaves the legacy plaintext MMKV file as zeroed pages, so its payload
+// length is 0 and no keys can be read from it.
+var ErrVaultEmpty = errors.New("vault payload is empty")
+
+// maxVaultPayload caps the payload length taken from a vault header so that a
+// corrupt or forged size cannot trigger a multi-gigabyte allocation.
+const maxVaultPayload = 256 << 20
+
+func vaultVersion(m *metadata) uint32 {
+	if m == nil {
+		return 0
+	}
+	return m.version
+}
 
 func (v vault) Keys() []string {
 	return maps.Keys(v)
@@ -55,6 +72,9 @@ func loadVault(src io.Reader, m *metadata, cryptoKey string) (Vault, error) {
 		return nil, fmt.Errorf("failed to read file size: %w", err)
 	}
 	size := binary.LittleEndian.Uint32(fileSizeBuf)
+	if size > maxVaultPayload {
+		return nil, fmt.Errorf("vault payload size %d exceeds the %d byte limit", size, maxVaultPayload)
+	}
 
 	if m != nil && size != m.actualSize {
 		return nil, fmt.Errorf("metadata and vault payload size mismatch")
@@ -72,6 +92,11 @@ func loadVault(src io.Reader, m *metadata, cryptoKey string) (Vault, error) {
 
 	// 将数据库完整解密
 	if len(cryptoKey) > 0 {
+		// Version < 2 metadata carries no IV; cipher.NewCFBDecrypter panics on a
+		// short IV, so reject such vaults instead of crashing the CLI.
+		if m == nil || len(m.aesVector) != aes.BlockSize {
+			return nil, fmt.Errorf("vault metadata has no AES IV (version %d), cannot decrypt with a crypto key", vaultVersion(m))
+		}
 		m_key := make([]byte, aes.BlockSize) // 16 bytes key
 		keyBytes, err := decodeCryptoKey(cryptoKey)
 		if err != nil {
@@ -88,6 +113,9 @@ func loadVault(src io.Reader, m *metadata, cryptoKey string) (Vault, error) {
 	}
 
 	if len(buf) < 4 {
+		if len(buf) == 0 {
+			return nil, ErrVaultEmpty
+		}
 		return nil, fmt.Errorf("vault payload too short: got %d bytes, need at least 4", len(buf))
 	}
 
