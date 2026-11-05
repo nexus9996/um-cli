@@ -22,6 +22,17 @@ func writeU32(buf *bytes.Buffer, v uint32) {
 // cover, carrying the given encrypted audio payload.
 func buildNCM(t *testing.T, audioKey, encryptedAudio []byte) []byte {
 	t.Helper()
+	return buildNCMWithCover(t, audioKey, encryptedAudio, nil)
+}
+
+// buildNCMWithCover builds a .ncm container using the layout that real NetEase
+// clients write (verified byte-for-byte against downloaded files): after the
+// meta block comes CRC32 + one flag byte (the 5 bytes the decoder seeks over),
+// then TWO u32 length fields that both hold the image size, then the image,
+// then the encrypted audio. So coverFrameLen == coverLen, and the audio starts
+// exactly at the end of the image.
+func buildNCMWithCover(t *testing.T, audioKey, encryptedAudio, cover []byte) []byte {
+	t.Helper()
 
 	// key box: "neteasecloudmusic" + key, padded to 128 bytes with the pad
 	// length (NCM pads to a fixed overall size, not to the AES block size).
@@ -45,11 +56,11 @@ func buildNCM(t *testing.T, audioKey, encryptedAudio []byte) []byte {
 	buf.Write([]byte{0, 0}) // 2-byte gap
 	writeU32(&buf, uint32(len(keyBox)))
 	buf.Write(keyBox)
-	writeU32(&buf, 0)          // meta length: no metadata at all
-	buf.Write(make([]byte, 5)) // crc32 + flag, skipped by the decoder
-	writeU32(&buf, 4)          // cover frame length (length field only)
-	writeU32(&buf, 0)          // cover length
-	buf.Write(make([]byte, 4)) // bytes skipped by the seek to the audio offset
+	writeU32(&buf, 0)                  // meta length: no metadata at all
+	buf.Write(make([]byte, 5))         // crc32 + flag, skipped by the decoder
+	writeU32(&buf, uint32(len(cover))) // cover frame length == image size
+	writeU32(&buf, uint32(len(cover))) // cover length == image size
+	buf.Write(cover)
 	buf.Write(encryptedAudio)
 	return buf.Bytes()
 }
@@ -76,6 +87,41 @@ func TestDecodeWithoutMetadata(t *testing.T) {
 	}
 	if !bytes.Equal(out, audioPlain) {
 		t.Fatal("decoded audio does not match the plaintext")
+	}
+}
+
+// Every NetEase download writes coverFrameLen == coverLen; requiring
+// frame >= cover+4 rejected all of them with "ncm invalid cover frame".
+func TestDecodeWithCoverFrameEqualToCoverLength(t *testing.T) {
+	audioKey := []byte("0123456789abcdef")
+	audioPlain := make([]byte, 512)
+	copy(audioPlain, []byte{'f', 'L', 'a', 'C', 0x00, 0x00, 0x00, 0x22})
+	for i := 8; i < len(audioPlain); i++ {
+		audioPlain[i] = byte(i * 7)
+	}
+	encrypted := make([]byte, len(audioPlain))
+	copy(encrypted, audioPlain)
+	newNcmCipher(audioKey).Decrypt(encrypted, 0)
+
+	cover := append([]byte{0xFF, 0xD8, 0xFF, 0xE0}, bytes.Repeat([]byte{0x5A}, 300)...)
+
+	file := buildNCMWithCover(t, audioKey, encrypted, cover)
+	d, ok := NewDecoder(&common.DecoderParams{Reader: bytes.NewReader(file), Logger: zap.NewNop()}).(*Decoder)
+	if !ok {
+		t.Fatal("unexpected decoder type")
+	}
+	if err := d.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	out, err := io.ReadAll(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(out, audioPlain) {
+		t.Fatal("decoded audio does not match the plaintext")
+	}
+	if !bytes.Equal(d.cover, cover) {
+		t.Fatalf("cover mismatch: got %d bytes, want %d", len(d.cover), len(cover))
 	}
 }
 

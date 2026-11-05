@@ -240,10 +240,11 @@ func (d *Decoder) readCoverData() error {
 	if iCoverLen > maxCoverLen {
 		return fmt.Errorf("ncm cover too large: %d", iCoverLen)
 	}
-	// The frame contains its own 4-byte length field plus the image; a frame
-	// shorter than that means the header is corrupt and the audio offset would
-	// land in the middle of the cover.
-	if int64(coverFrameLen) < int64(iCoverLen)+4 {
+	// NetEase clients write coverFrameLen == iCoverLen (the frame is this
+	// second length field plus the image, and the "+4" below accounts for the
+	// field itself), so anything shorter than the image means the header is
+	// corrupt and the audio offset would land inside the cover.
+	if coverFrameLen < iCoverLen {
 		return fmt.Errorf("ncm invalid cover frame: frame=%d cover=%d", coverFrameLen, iCoverLen)
 	}
 
@@ -255,7 +256,10 @@ func (d *Decoder) readCoverData() error {
 		d.cover = coverBuf
 	}
 
-	offsetAudioData := coverFrameStartOffset + int64(coverFrameLen) + 4
+	// Audio starts right after the image; derive the offset from what was
+	// actually read instead of trusting coverFrameLen, which is only equal to
+	// iCoverLen in practice.
+	offsetAudioData := coverFrameStartOffset + 4 + int64(iCoverLen)
 	if offsetAudioData < 0 || offsetAudioData > d.fileSize {
 		return fmt.Errorf("ncm invalid audio offset: %d (file size %d)", offsetAudioData, d.fileSize)
 	}
