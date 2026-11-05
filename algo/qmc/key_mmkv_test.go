@@ -48,6 +48,7 @@ func resetMMKVState() {
 	streamKeyVaults = nil
 	mmkvInitOnce = sync.Once{}
 	mmkvInitErr = nil
+	deriveVaultKeysHook = func() []string { return nil }
 }
 
 // The plaintext vault of QQ Music 20.x+ is an empty placeholder; the keys live
@@ -161,5 +162,41 @@ func TestOpenMMKVVaultsEmptyPlainVaultWithCryptoKey(t *testing.T) {
 	}
 	if errors.Is(err, mmkv.ErrVaultEmpty) {
 		t.Fatalf("the plaintext vault being empty is expected; got: %v", err)
+	}
+}
+
+// Vectors verified against a real install: these keys open the vaults named
+// 797g0 / 808h18 / 919i299 (the IDs are OpenUDID rotated by idx+3).
+func TestDeriveKeysFromUDIDVectors(t *testing.T) {
+	const udid = "464d7449bdd208b20d317041d4bfa3f688d6c378"
+	keys := deriveKeysFromUDID(udid)
+	if len(keys) != 32 {
+		t.Fatalf("want 32 slots, got %d", len(keys))
+	}
+	for i, want := range []string{"aac6087aa02114d9", "de69672c2ed8c7a1", "8221121deafa486b"} {
+		if keys[i] != want {
+			t.Fatalf("slot %d: got %q, want %q", i, keys[i], want)
+		}
+	}
+	if got := deriveKeysFromUDID(""); got != nil {
+		t.Fatalf("empty UDID must yield no keys, got %v", got)
+	}
+}
+
+// Parsing the OpenUDID out of the preferences plist covers all three encodings
+// the client has used.
+func TestOpenUDIDFromShapes(t *testing.T) {
+	const want = "464d7449bdd208b20d317041d4bfa3f688d6c378"
+	cases := []map[string]any{
+		{"OpenUDID": want},
+		{"OpenUDID": map[string]any{"OpenUDID": want}},
+	}
+	for i, c := range cases {
+		if got := openUDIDFrom(c); got != want {
+			t.Fatalf("case %d: got %q", i, got)
+		}
+	}
+	if got := openUDIDFrom(map[string]any{}); got != "" {
+		t.Fatalf("missing key must yield empty, got %q", got)
 	}
 }

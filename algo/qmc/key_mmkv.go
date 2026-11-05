@@ -25,6 +25,10 @@ var (
 	mmkvInitErr  error
 )
 
+// deriveVaultKeysHook is replaced by tests so key derivation does not depend on
+// the machine running the test.
+var deriveVaultKeysHook = deriveMMKVVaultKeys
+
 // VaultCryptoKey is the AES-128 key used to decrypt version-3 encrypted MMKV vaults.
 // Set via CLI flag --qmc-mmkv-key or by calling SetVaultCryptoKey.
 var VaultCryptoKey string
@@ -199,14 +203,23 @@ func openMMKVVaults(plainDir, encDir string, logger *zap.Logger) error {
 		logger.Debug("mmkv vault opened", zap.Strings("keys", vault.Keys()))
 	}
 
-	if VaultCryptoKey == "" {
+	cryptoKeys := []string{}
+	if VaultCryptoKey != "" {
+		cryptoKeys = append(cryptoKeys, VaultCryptoKey)
+	} else if keys := deriveVaultKeysHook(); len(keys) > 0 {
+		cryptoKeys = keys
+		logger.Debug("derived MMKV vault keys from the local QQ Music install",
+			zap.Int("slots", len(keys)))
+	}
+
+	if len(cryptoKeys) == 0 {
 		if plainErr != nil {
-			return fmt.Errorf("no usable MMKV vault: %v; the encrypted vaults need --qmc-mmkv-key", plainErr)
+			return fmt.Errorf("no usable MMKV vault: %v; the encrypted vaults need --qmc-mmkv-key or a readable QQ Music OpenUDID", plainErr)
 		}
 		return nil
 	}
 
-	encErr := openEncryptedVaults(encDir, logger)
+	encErr := openEncryptedVaults(encDir, cryptoKeys, logger)
 	if encErr != nil {
 		if plainErr != nil {
 			return fmt.Errorf("plaintext vault unusable (%v); encrypted vaults: %w", plainErr, encErr)
@@ -217,13 +230,9 @@ func openMMKVVaults(plainDir, encDir string, logger *zap.Logger) error {
 }
 
 // openEncryptedVaults opens the AES-encrypted vaults that QQ Music 20.x+ writes
-// and records every vault holding keys as a lookup fallback.
-func openEncryptedVaults(mmkvDir string, logger *zap.Logger) error {
-	mgr, mgrErr := mmkv.NewManager(mmkvDir)
-	if mgrErr != nil {
-		return fmt.Errorf("init mmkv manager for encrypted vault: %w", mgrErr)
-	}
-
+// and records every vault holding keys as a lookup fallback. Each vault has its
+// own key (slot idx), so every candidate vault is tried with every key.
+func openEncryptedVaults(mmkvDir string, cryptoKeys []string, logger *zap.Logger) error {
 	// Scan for version-3 encrypted vault candidates in iData directory.
 	// Known encrypted vault IDs used by QQ Music 20.x+:
 	candidateIDs := []string{"797g0", "808h18", "131k4", "919i299", "020j3005"}
@@ -256,34 +265,49 @@ func openEncryptedVaults(mmkvDir string, logger *zap.Logger) error {
 		}
 	}
 
+	// Each vault has its own key (slot idx), so every candidate is tried with
+	// every key. A manager caches vaults by ID regardless of the key, so one
+	// manager is kept per key to keep the probes independent.
+	managers := make(map[string]mmkv.Manager, len(cryptoKeys))
+	managerFor := func(key string) (mmkv.Manager, error) {
+		if mgr, ok := managers[key]; ok {
+			return mgr, nil
+		}
+		mgr, err := mmkv.NewManager(mmkvDir)
+		if err != nil {
+			return nil, fmt.Errorf("init mmkv manager for encrypted vault: %w", err)
+		}
+		managers[key] = mgr
+		return mgr, nil
+	}
+
 	for _, vaultID := range candidateIDs {
-		vault, openErr := mgr.OpenVaultCrypto(vaultID, VaultCryptoKey)
-		if openErr != nil {
-			// Candidates are speculative: non-matching IDs are expected to fail.
-			logger.Debug("encrypted vault not usable",
+		var loaded bool
+		for _, key := range cryptoKeys {
+			mgr, err := managerFor(key)
+			if err != nil {
+				return err
+			}
+			vault, openErr := mgr.OpenVaultCrypto(vaultID, key)
+			if openErr != nil || len(vault.Keys()) == 0 {
+				continue
+			}
+			loaded = true
+			logger.Debug("encrypted mmkv vault loaded",
 				zap.String("vault", vaultID),
-				zap.Error(openErr))
-			continue
+				zap.Int("keys", len(vault.Keys())))
+
+			// Store every viable vault for fallback lookup; the first one also
+			// becomes the primary vault.
+			streamKeyVaults = append(streamKeyVaults, vault)
+			if streamKeyVault == nil {
+				streamKeyVault = vault
+			}
+			break
 		}
-
-		// Verify the vault has usable keys by checking if it has any entries
-		keys := vault.Keys()
-		if len(keys) == 0 {
-			logger.Debug("encrypted vault opened but is empty",
-				zap.String("vault", vaultID))
-			continue
-		}
-
-		logger.Debug("encrypted mmkv vault loaded",
-			zap.String("vault", vaultID),
-			zap.Int("keys", len(keys)))
-
-		// Store all viable vaults for fallback lookup
-		streamKeyVaults = append(streamKeyVaults, vault)
-
-		// Set the primary vault to the first viable one
-		if streamKeyVault == nil {
-			streamKeyVault = vault
+		if !loaded {
+			// Candidates are speculative: non-matching IDs are expected to fail.
+			logger.Debug("encrypted vault not usable", zap.String("vault", vaultID))
 		}
 	}
 
